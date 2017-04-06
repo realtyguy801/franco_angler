@@ -2234,6 +2234,7 @@ dhd_pno_set_for_gscan(dhd_pub_t *dhd, struct dhd_pno_gscan_params *gscan_params)
 
 	pfn_gscan_cfg_t->flags =
 	         (gscan_params->send_all_results_flag & GSCAN_SEND_ALL_RESULTS_MASK);
+	pfn_gscan_cfg_t->flags |= FORCE_ALL_CHANNEL_BUCKETS_IN_FIRST_SCAN;
 	pfn_gscan_cfg_t->count_of_channel_buckets = num_buckets_to_fw;
 	pfn_gscan_cfg_t->retry_threshold = GSCAN_RETRY_THRESHOLD;
 
@@ -3622,7 +3623,17 @@ void * dhd_handle_swc_evt(dhd_pub_t *dhd, const void *event_data, int *send_evt_
 	}
 
 	change_array = &params->change_array[params->results_rxed_so_far];
-	memcpy(change_array, results->list, sizeof(wl_pfn_significant_net_t) * results->pkt_count);
+	if ((params->results_rxed_so_far + results->pkt_count) >
+		results->total_count) {
+		DHD_ERROR(("Error: Invalid data reset the counters!!\n"));
+		*send_evt_bytes = 0;
+		kfree(params->change_array);
+		params->change_array = NULL;
+		return ptr;
+	}
+
+	memcpy(change_array, results->list,
+		sizeof(wl_pfn_significant_net_t) * results->pkt_count);
 	params->results_rxed_so_far += results->pkt_count;
 
 	if (params->results_rxed_so_far == results->total_count) {

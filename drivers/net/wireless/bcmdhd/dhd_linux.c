@@ -173,7 +173,18 @@ static u32 vendor_oui = CONFIG_DHD_SET_RANDOM_MAC_VAL;
 
 /* Maximum STA per radio */
 #define DHD_MAX_STA     32
-
+#define FILE_BLOCK_READ_SIZE 256
+/* [FIX ME] Path define can be moved to Kconfig. Currently defined here */
+#define FILTER_IE_PATH "/etc/wifi/filter_ie"
+#define FILTER_IE_BUFSZ 1024 /* ioc buffsize for FILTER_IE */
+#define NULL_CHECK(p, s, err)  \
+			do { \
+				if (!(p)) { \
+					printf("NULL POINTER (%s) : %s\n", __FUNCTION__, (s)); \
+					err = BCME_ERROR; \
+					return err; \
+				} \
+			} while (0)
 
 const uint8 wme_fifo2ac[] = { 0, 1, 2, 3, 1, 1 };
 const uint8 prio2fifo[8] = { 1, 0, 0, 1, 2, 2, 3, 3 };
@@ -245,12 +256,6 @@ print_tainted()
 	return "";
 }
 #endif	/* LINUX_VERSION_CODE == KERNEL_VERSION(2, 6, 15) */
-
-/* Linux wireless extension support */
-#if defined(WL_WIRELESS_EXT)
-#include <wl_iw.h>
-extern wl_iw_extra_params_t  g_wl_iw_params;
-#endif /* defined(WL_WIRELESS_EXT) */
 
 #if defined(CONFIG_HAS_EARLYSUSPEND) && defined(DHD_USE_EARLYSUSPEND)
 #include <linux/earlysuspend.h>
@@ -369,9 +374,6 @@ struct ipv6_work_info_t {
 
 /* Local private structure (extension of pub) */
 typedef struct dhd_info {
-#if defined(WL_WIRELESS_EXT)
-	wl_iw_t		iw;		/* wireless extensions state (must be first) */
-#endif /* defined(WL_WIRELESS_EXT) */
 	dhd_pub_t pub;
 	dhd_if_t *iflist[DHD_MAX_IFS]; /* for supporting multiple interfaces */
 
@@ -691,10 +693,6 @@ static void dhd_dump_htsfhisto(histo_t *his, char *s);
 int dhd_monitor_init(void *dhd_pub);
 int dhd_monitor_uninit(void);
 
-
-#if defined(WL_WIRELESS_EXT)
-struct iw_statistics *dhd_get_wireless_stats(struct net_device *dev);
-#endif /* defined(WL_WIRELESS_EXT) */
 
 static void dhd_dpc(ulong data);
 /* forward decl */
@@ -4040,17 +4038,6 @@ dhd_ioctl_entry(struct net_device *net, struct ifreq *ifr, int cmd)
 		return -1;
 	}
 
-#if defined(WL_WIRELESS_EXT)
-	/* linux wireless extensions */
-	if ((cmd >= SIOCIWFIRST) && (cmd <= SIOCIWLAST)) {
-		/* may recurse, do NOT lock */
-		ret = wl_iw_ioctl(net, ifr, cmd);
-		DHD_PERIM_UNLOCK(&dhd->pub);
-		DHD_OS_WAKE_UNLOCK(&dhd->pub);
-		return ret;
-	}
-#endif /* defined(WL_WIRELESS_EXT) */
-
 #if LINUX_VERSION_CODE > KERNEL_VERSION(2, 4, 2)
 	if (cmd == SIOCETHTOOL) {
 		ret = dhd_ethtool(dhd, (void*)ifr->ifr_data);
@@ -4531,7 +4518,7 @@ dhd_allocate_if(dhd_pub_t *dhdpub, int ifidx, char *name,
 	dhd_if_t *ifp;
 
 	if((dhdinfo == NULL) || (ifidx >= DHD_MAX_IFS))
-		goto fail;
+		return NULL;
 	ifp = dhdinfo->iflist[ifidx];
 
 	if (ifp != NULL) {
@@ -5017,17 +5004,6 @@ dhd_attach(osl_t *osh, struct dhd_bus *bus, uint bus_hdrlen)
 	dhd_monitor_init(&dhd->pub);
 	dhd_state |= DHD_ATTACH_STATE_CFG80211;
 #endif
-#if defined(WL_WIRELESS_EXT)
-	/* Attach and link in the iw */
-	if (!(dhd_state &  DHD_ATTACH_STATE_CFG80211)) {
-		if (wl_iw_attach(net, (void *)&dhd->pub) != 0) {
-		DHD_ERROR(("wl_iw_attach failed\n"));
-		goto fail;
-	}
-	dhd_state |= DHD_ATTACH_STATE_WL_ATTACH;
-	}
-#endif /* defined(WL_WIRELESS_EXT) */
-
 	/* attach debug support */
 	if (dhd_os_dbg_attach(&dhd->pub)) {
 		DHD_ERROR(("%s debug module attach failed\n", __FUNCTION__));
@@ -6289,6 +6265,12 @@ dhd_preinit_ioctls(dhd_pub_t *dhd)
 	}
 #endif
 
+#ifdef FILTER_IE
+	/* Failure to configure filter IE is not a fatal error, ignore it.*/
+	if (!(dhd->op_mode & (DHD_FLAG_HOSTAP_MODE | DHD_FLAG_MFG_MODE)))
+		dhd_read_from_file(dhd);
+#endif /* FILTER_IE */
+
 #ifdef WL11U
 	dhd_interworking_enable(dhd);
 #endif /* WL11U */
@@ -6831,15 +6813,6 @@ dhd_register_if(dhd_pub_t *dhdp, int ifidx, bool need_rtnl_lock)
 	net->ethtool_ops = &dhd_ethtool_ops;
 #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 24) */
 
-#if defined(WL_WIRELESS_EXT)
-#if WIRELESS_EXT < 19
-	net->get_wireless_stats = dhd_get_wireless_stats;
-#endif /* WIRELESS_EXT < 19 */
-#if WIRELESS_EXT > 12
-	net->wireless_handlers = (struct iw_handler_def *)&wl_iw_handler_def;
-#endif /* WIRELESS_EXT > 12 */
-#endif /* defined(WL_WIRELESS_EXT) */
-
 	dhd->pub.rxsz = DBUS_RX_BUFFER_SIZE_DHD(net);
 
 	memcpy(net->dev_addr, temp_addr, ETHER_ADDR_LEN);
@@ -6861,10 +6834,6 @@ dhd_register_if(dhd_pub_t *dhdp, int ifidx, bool need_rtnl_lock)
 
 	printf("Register interface [%s]  MAC: "MACDBG"\n\n", net->name,
 		MAC2STRDBG(net->dev_addr));
-
-#if defined(SOFTAP) && defined(WL_WIRELESS_EXT) && !defined(WL_CFG80211)
-		wl_iw_iscan_set_scan_broadcast_prep(net, 1);
-#endif
 
 #if defined(BCMLXSDMMC) && (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 27))
 	if (ifidx == 0) {
@@ -6992,13 +6961,6 @@ void dhd_detach(dhd_pub_t *dhdp)
 			unregister_early_suspend(&dhd->early_suspend);
 	}
 #endif /* CONFIG_HAS_EARLYSUSPEND && DHD_USE_EARLYSUSPEND */
-
-#if defined(WL_WIRELESS_EXT)
-	if (dhd->dhd_state & DHD_ATTACH_STATE_WL_ATTACH) {
-		/* Detatch and unlink in the iw */
-		wl_iw_detach();
-	}
-#endif /* defined(WL_WIRELESS_EXT) */
 
 	/* delete all interfaces, start with virtual  */
 	if (dhd->dhd_state & DHD_ATTACH_STATE_ADD_IF) {
@@ -7614,26 +7576,6 @@ void dhd_os_prefree(dhd_pub_t *dhdpub, void *addr, uint size)
 {
 }
 
-#if defined(WL_WIRELESS_EXT)
-struct iw_statistics *
-dhd_get_wireless_stats(struct net_device *dev)
-{
-	int res = 0;
-	dhd_info_t *dhd = DHD_DEV_INFO(dev);
-
-	if (!dhd->pub.up) {
-		return NULL;
-	}
-
-	res = wl_iw_get_wireless_stats(dev, &dhd->iw.wstats);
-
-	if (res == 0)
-		return &dhd->iw.wstats;
-	else
-		return NULL;
-}
-#endif /* defined(WL_WIRELESS_EXT) */
-
 static int
 dhd_wl_host_event(dhd_info_t *dhd, int *ifidx, void *pktdata, size_t pktlen,
 	wl_event_msg_t *event, void **data)
@@ -7655,18 +7597,6 @@ dhd_wl_host_event(dhd_info_t *dhd, int *ifidx, void *pktdata, size_t pktlen,
 
 	if ((dhd->iflist[*ifidx] == NULL) || (dhd->iflist[*ifidx]->net == NULL))
 		return BCME_ERROR;
-
-#if defined(WL_WIRELESS_EXT)
-	if (event->bsscfgidx == 0) {
-		/*
-		 * Wireless ext is on primary interface only
-		 */
-
-		if (dhd->iflist[*ifidx]->net) {
-			wl_iw_event(dhd->iflist[*ifidx]->net, event, *data);
-		}
-	}
-#endif /* defined(WL_WIRELESS_EXT)  */
 
 #ifdef WL_CFG80211
 
@@ -8019,6 +7949,11 @@ int dhd_dev_get_feature_set(struct net_device *dev)
 #ifdef NDO_CONFIG_SUPPORT
 	feature_set |= WIFI_FEATURE_CONFIG_NDO;
 #endif /* NDO_CONFIG_SUPPORT */
+#ifdef FILTER_IE
+	if (FW_SUPPORTED(dhd, fie)) {
+		feature_set |= WIFI_FEATURE_FILTER_IE;
+	}
+#endif /* FILTER_IE */
 	return feature_set;
 }
 
@@ -9300,7 +9235,7 @@ dhd_dev_apf_enable_filter(struct net_device *ndev)
 {
 	dhd_info_t *dhd = DHD_DEV_INFO(ndev);
 	dhd_pub_t *dhdp = &dhd->pub;
-	int ret;
+	int ret = 0;
 
 	DHD_APF_LOCK(ndev);
 
@@ -9319,7 +9254,7 @@ dhd_dev_apf_disable_filter(struct net_device *ndev)
 {
 	dhd_info_t *dhd = DHD_DEV_INFO(ndev);
 	dhd_pub_t *dhdp = &dhd->pub;
-	int ret;
+	int ret = 0;
 
 	DHD_APF_LOCK(ndev);
 
@@ -9338,7 +9273,7 @@ dhd_dev_apf_delete_filter(struct net_device *ndev)
 {
 	dhd_info_t *dhd = DHD_DEV_INFO(ndev);
 	dhd_pub_t *dhdp = &dhd->pub;
-	int ret;
+	int ret = 0;
 
 	DHD_APF_LOCK(ndev);
 
@@ -9369,9 +9304,6 @@ static void dhd_hang_process(void *dhd_info, void *event_info, u8 event)
 		rtnl_lock();
 		dev_close(dev);
 		rtnl_unlock();
-#endif
-#if defined(WL_WIRELESS_EXT)
-		wl_iw_send_priv_event(dev, "HANG");
 #endif
 #if defined(WL_CFG80211)
 		wl_cfg80211_hang(dev, WLAN_REASON_UNSPECIFIED);
@@ -9658,6 +9590,44 @@ exit:
 	return ret;
 }
 #endif /* DHD_DEBUG */
+
+#ifdef FILTER_IE
+int dhd_read_from_file(dhd_pub_t *dhd)
+{
+	int ret = 0, nread = 0;
+	void *fd;
+	uint8 *buf;
+	NULL_CHECK(dhd, "dhd is NULL", ret);
+
+	buf = kzalloc(FILE_BLOCK_READ_SIZE, GFP_KERNEL);
+	if (!buf) {
+		DHD_ERROR(("error: failed to alllocate buf.\n"));
+		return BCME_NOMEM;
+	}
+
+	/* open file to read */
+	fd = dhd_os_open_image(FILTER_IE_PATH);
+	if (!fd) {
+		DHD_ERROR(("error: failed to open %s\n", FILTER_IE_PATH));
+		ret = BCME_EPERM;
+		goto exit;
+	}
+	nread = dhd_os_get_image_block(buf, (FILE_BLOCK_READ_SIZE - 1), fd);
+	if (nread > 0) {
+		buf[nread] = '\0';
+		if ((ret = dhd_parse_filter_ie(dhd, buf)) < 0) {
+			DHD_ERROR(("error: failed to parse filter ie\n"));
+		}
+	} else {
+		DHD_ERROR(("error: zero length file.failed to read\n"));
+		ret = BCME_ERROR;
+	}
+	dhd_os_close_image(fd);
+exit:
+	kfree(buf);
+	return ret;
+}
+#endif /* FILTER_IE */
 
 int dhd_os_wake_lock_timeout(dhd_pub_t *pub)
 {
@@ -10973,3 +10943,217 @@ dhd_linux_get_primary_netdev(dhd_pub_t *dhdp)
 	else
 		return NULL;
 }
+
+#if defined FILTER_IE
+int dhd_get_filter_ie_count(dhd_pub_t *dhdp, uint8* buf)
+{
+	uint8* pstr = buf;
+	int element_count = 0;
+
+	if (buf == NULL) {
+		return BCME_ERROR;
+	}
+
+	while (*pstr != '\0') {
+		if (*pstr == '\n') {
+			element_count++;
+		}
+		pstr++;
+	}
+	/*
+	 * New line character must not be present after last line.
+	 * To count last line
+	 */
+	element_count++;
+
+	return element_count;
+}
+
+int dhd_parse_oui(dhd_pub_t *dhd, uint8 *inbuf, uint8 *oui, int len)
+{
+	uint8 i, j, msb, lsb, oui_len = 0;
+	/*
+	 * OUI can vary from 3 bytes to 5 bytes.
+	 * While reading from file as ascii input it can
+	 * take maximum size of 14 bytes and minumum size of
+	 * 8 bytes including ":"
+	 * Example 5byte OUI <AB:DE:BE:CD:FA>
+	 * Example 3byte OUI <AB:DC:EF>
+	 */
+
+	if ((inbuf == NULL) || (len < 8) || (len > 14 )) {
+		DHD_ERROR(("error: failed to parse OUI \n"));
+		return BCME_ERROR;
+	}
+
+	for (j = 0, i = 0; i < len; i += 3, ++j) {
+		if (!bcm_isxdigit(inbuf[i]) || !bcm_isxdigit(inbuf[i + 1])) {
+			DHD_ERROR(("error: invalid OUI format \n"));
+			return BCME_ERROR;
+		}
+		msb = inbuf[i] > '9' ? bcm_toupper(inbuf[i]) - 'A' + 10 : inbuf[i] - '0';
+		lsb = inbuf[i + 1] > '9' ? bcm_toupper(inbuf[i + 1]) - 'A' + 10 : inbuf[i + 1] - '0';
+		oui[j] = (msb << 4) | lsb;
+	}
+	/* Size of oui.It can vary from 3/4/5 */
+	oui_len = j;
+
+	return oui_len;
+}
+
+int dhd_check_valid_ie(dhd_pub_t *dhdp, uint8* buf, int len)
+{
+	int i = 0;
+
+	while (i < len) {
+		if (!bcm_isdigit(buf[i])) {
+			DHD_ERROR(("error: non digit value found in filter_ie \n"));
+			return BCME_ERROR;
+		}
+		i++;
+	}
+	if (bcm_atoi((char*)buf) > 255) {
+		DHD_ERROR(("error: element id cannot be greater than 255 \n"));
+		return BCME_ERROR;
+	}
+
+	return BCME_OK;
+}
+
+int dhd_parse_filter_ie(dhd_pub_t *dhd, uint8 *buf)
+{
+	int element_count = 0, i = 0, oui_size = 0, ret = 0;
+	uint16 kflags, bufsize, buf_space_left, id = 0, len = 0;
+	uint16 filter_iovsize, all_tlvsize;
+	wl_filter_ie_tlv_t *p_ie_tlv = NULL;
+	wl_filter_ie_iov_t *p_filter_iov = (wl_filter_ie_iov_t *) NULL;
+	char *token = NULL, *ele_token = NULL, *oui_token = NULL, *type = NULL;
+	uint8 data[20];
+
+	element_count = dhd_get_filter_ie_count(dhd, buf);
+	DHD_INFO(("total element count %d \n", element_count));
+	kflags = in_atomic() ? GFP_ATOMIC : GFP_KERNEL;
+	/* Calculate the whole buffer size */
+	filter_iovsize = sizeof(wl_filter_ie_iov_t) + FILTER_IE_BUFSZ;
+	p_filter_iov = kzalloc(filter_iovsize, kflags);
+
+	if (p_filter_iov == NULL) {
+		DHD_ERROR(("error: failed to allocate %d bytes of memory\n", filter_iovsize));
+		return BCME_ERROR;
+	}
+
+	/* setup filter iovar header */
+	p_filter_iov->version = WL_FILTER_IE_VERSION;
+	p_filter_iov->len = filter_iovsize;
+	p_filter_iov->fixed_length = p_filter_iov->len - FILTER_IE_BUFSZ;
+	p_filter_iov->pktflag = FC_PROBE_REQ;
+	p_filter_iov->option = WL_FILTER_IE_CHECK_SUB_OPTION;
+	/* setup TLVs */
+	bufsize = filter_iovsize - WL_FILTER_IE_IOV_HDR_SIZE; /* adjust available size for TLVs */
+	p_ie_tlv = &p_filter_iov->tlvs[0];
+	buf_space_left = bufsize;
+
+	while ((i < element_count) && (buf != NULL)) {
+		len = 0;
+		/* token contains one line of input data */
+		token = bcmstrtok((char**)&buf, "\n", NULL);
+		if (token == NULL) {
+			break;
+		}
+		if ((ele_token = bcmstrstr(token, ",")) == NULL) {
+		/* only element id is present */
+			if (dhd_check_valid_ie(dhd, token, strlen(token)) == BCME_ERROR) {
+				DHD_ERROR(("error: Invalid element id \n"));
+				ret = BCME_ERROR;
+				goto exit;
+			}
+			id = bcm_atoi((char*)token);
+			data[len++] = WL_FILTER_IE_SET;
+		} else {
+			/* oui is present */
+			ele_token = bcmstrtok(&token, ",", NULL);
+			if ((ele_token == NULL) || (dhd_check_valid_ie(dhd, ele_token,
+				strlen(ele_token)) == BCME_ERROR)) {
+				DHD_ERROR(("error: Invalid element id \n"));
+				ret = BCME_ERROR;
+				goto exit;
+			}
+			id =  bcm_atoi((char*)ele_token);
+			data[len++] = WL_FILTER_IE_SET;
+			if ((oui_token = bcmstrstr(token, ",")) == NULL) {
+				oui_size = dhd_parse_oui(dhd, token, &(data[len]), strlen(token));
+				if (oui_size == BCME_ERROR) {
+					DHD_ERROR(("error: Invalid OUI \n"));
+					ret = BCME_ERROR;
+					goto exit;
+				}
+				len += oui_size;
+			} else {
+				/* type is present */
+				oui_token = bcmstrtok(&token, ",", NULL);
+				if ((oui_token == NULL) || ((oui_size = dhd_parse_oui(dhd, oui_token,
+					&(data[len]), strlen(oui_token))) == BCME_ERROR)) {
+					DHD_ERROR(("error: Invalid OUI \n"));
+					ret = BCME_ERROR;
+					goto exit;
+				}
+				len += oui_size;
+				if ((type = bcmstrstr(token, ",")) == NULL) {
+					if (dhd_check_valid_ie(dhd, token, strlen(token)) == BCME_ERROR) {
+						DHD_ERROR(("error: Invalid type \n"));
+						ret = BCME_ERROR;
+						goto exit;
+					}
+					data[len++] = bcm_atoi((char*)token);
+				} else {
+					/* subtype is present */
+					type = bcmstrtok(&token, ",", NULL);
+					if ((type == NULL) || (dhd_check_valid_ie(dhd, type,
+						strlen(type)) == BCME_ERROR)) {
+						DHD_ERROR(("error: Invalid type \n"));
+						ret = BCME_ERROR;
+						goto exit;
+					}
+					data[len++] = bcm_atoi((char*)type);
+					/* subtype is last element */
+					if ((token == NULL) || (*token == '\0') ||
+						(dhd_check_valid_ie(dhd, token, strlen(token)) == BCME_ERROR)) {
+						DHD_ERROR(("error: Invalid subtype \n"));
+						ret = BCME_ERROR;
+						goto exit;
+					}
+					data[len++] = bcm_atoi((char*)token);
+				}
+			}
+		}
+		ret = bcm_pack_xtlv_entry((uint8 **)&p_ie_tlv,
+			&buf_space_left, id, len, data, BCM_XTLV_OPTION_ALIGN32);
+		if (ret != BCME_OK) {
+			DHD_ERROR(("%s : bcm_pack_xtlv_entry() failed ,"
+				"status=%d\n", __FUNCTION__, ret));
+			kfree(p_filter_iov);
+			return ret;
+		}
+		i++;
+	}
+	if (i == 0) {
+	/* file is empty or first line is blank */
+		DHD_ERROR(("error: filter_ie file is empty or first line is blank \n"));
+		kfree(p_filter_iov);
+		return BCME_ERROR;
+	}
+	/* update the iov header, set len to include all TLVs + header */
+	all_tlvsize = (bufsize - buf_space_left);
+	p_filter_iov->len = htol16(all_tlvsize + WL_FILTER_IE_IOV_HDR_SIZE);
+	ret = dhd_iovar(dhd, 0, "filter_ie", (void *)p_filter_iov, p_filter_iov->len, 1);
+	if (ret != BCME_OK) {
+		DHD_ERROR(("error: IOVAR failed, status=%d\n", ret));
+	}
+exit:
+	/* clean up */
+	kfree(p_filter_iov);
+	return ret;
+}
+#endif /* FILTER_IE */
+
+
